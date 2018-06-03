@@ -48,44 +48,210 @@ def send_to_yaml(yaml_filename, dict_list):
 
 # Callback function for your Point Cloud Subscriber
 def pcl_callback(pcl_msg):
-
+    # Define object array variables
+    detected_objects_labels = []
+    detected_objects_centroids = {}
+    detected_objects_list = []
 # Exercise-2 TODOs:
 
     # TODO: Convert ROS msg to PCL data
-    
+    cloud = ros_to_pcl(pcl_msg)
     # TODO: Statistical Outlier Filtering
+    outlier_filter = cloud.make_statistical_outlier_filter()
+
+    # Set the number of neighboring points to analyze for any given point
+    outlier_filter.set_mean_k(50)
+
+    # Set threshold scale factor
+    x = 0.05
+
+    outlier_filter.set_std_dev_mul_thresh(x)
+    cloud_filtered = outlier_filter.filter()
 
     # TODO: Voxel Grid Downsampling
+    vox = cloud_filtered.make_voxel_grid_filter()
 
+    LEAF_SIZE = 0.01
+    vox.set_leaf_size(LEAF_SIZE, LEAF_SIZE, LEAF_SIZE)
+
+    cloud_filtered = vox.filter()
     # TODO: PassThrough Filter
+    # Passthrough Z
+    passthrough = cloud_filtered.make_passthrough_filter()
+
+    filter_axis = 'z'
+    passthrough.set_filter_field_name(filter_axis)
+    axis_min = 0.6
+    axis_max = 1.5
+    passthrough.set_filter_limits(axis_min, axis_max)
+
+    cloud_filtered = passthrough.filter()
+
+    # Passthrough Y
+    passthrough = cloud_filtered.make_passthrough_filter()
+
+    filter_axis = 'y'
+    passthrough.set_filter_field_name(filter_axis)
+    axis_min = -0.5
+    axis_max = 0.5
+    passthrough.set_filter_limits(axis_min, axis_max)
+
+    cloud_filtered = passthrough.filter()
 
     # TODO: RANSAC Plane Segmentation
+    seg = cloud_filtered.make_segmenter()
+
+    seg.set_model_type(pcl.SACMODEL_PLANE)
+    seg.set_method_type(pcl.SAC_RANSAC)
+
+    max_distance = 0.015
+    seg.set_distance_threshold(max_distance)
+
+    inliers, coefficients = seg.segment()
 
     # TODO: Extract inliers and outliers
+    cloud_table = cloud_filtered.extract(inliers, negative=False)
+    cloud_objects = cloud_filtered.extract(inliers, negative=True)
 
     # TODO: Euclidean Clustering
+    white_cloud = XYZRGB_to_XYZ(cloud_objects)
+    tree = white_cloud.make_kdtree()
+    ec = white_cloud.make_EuclideanClusterExtraction()
+
+    ec.set_ClusterTolerance(0.02)
+    ec.set_MinClusterSize(40)
+    ec.set_MaxClusterSize(800)
+
+    ec.set_SearchMethod(tree)
+
+    cluster_indices = ec.Extract()
 
     # TODO: Create Cluster-Mask Point Cloud to visualize each cluster separately
+    cluster_color = get_color_list(len(cluster_indices))
+
+    color_cluster_point_list = []
+    print "Starting coloring process"
+    for j, indices in enumerate(cluster_indices):
+        print "object ", j + 1
+        print "indices length: ", len(indices)
+        for i, indice in enumerate(indices):
+            color_cluster_point_list.append([white_cloud[indice][0],
+                                             white_cloud[indice][1],
+                                             white_cloud[indice][2],
+                                             rgb_to_float(cluster_color[j])])
+
+    cluster_cloud = pcl.PointCloud_PointXYZRGB()
+    cluster_cloud.from_list(color_cluster_point_list)
 
     # TODO: Convert PCL data to ROS messages
+    ros_cloud_table = pcl_to_ros(cloud_table)
+    ros_cloud_objects = pcl_to_ros(cloud_objects)
+    ros_cluster_cloud = pcl_to_ros(cluster_cloud)
 
     # TODO: Publish ROS messages
+    print "Publishing data"
+    pcl_objects_pub.publish(ros_cloud_objects)
+    pcl_table_pub.publish(ros_cloud_table)
+    pcl_cluster_pub.publish(ros_cluster_cloud)
 
 # Exercise-3 TODOs:
 
     # Classify the clusters! (loop through each detected cluster one at a time)
-
+    for index, pts_list in enumerate(cluster_indices):
+        pcl_cluster = cloud_objects.extract(pts_list)
         # Grab the points for the cluster
-
+        ros_cluster = pcl_to_ros(pcl_cluster)
         # Compute the associated feature vector
-
+        color_hists = compute_color_histograms(ros_cluster)
+        normals = get_normals(ros_cluster)
+        normal_hists = compute_normal_histograms(normals)
+        feature = np.concatenate((color_hists, normal_hists))
         # Make the prediction
-
+        prediction = clf.predict(scaler.transform(feature.reshape(1, -1)))
+        label = encoder.inverse_transform(prediction)[0]
+        detected_objects_labels.append(label)
         # Publish a label into RViz
+        label_pos = list(white_cloud[pts_list[0]])
+        label_pos[2] += .4
+        object_markers_pub.publish(make_label(label,label_pos, index))
+
+        # Obtain centroid of detected objects
+        points_arr = pcl_cluster.to_array()
+        if label in detected_objects_centroids:
+            print "Found duplicated object! Overwriting object " + label
+        detected_objects_centroids[label] = np.mean(points_arr, axis=0)[:3]
 
         # Add the detected object to the list of detected objects.
+        do = DetectedObject()
+        do.label = label
+        do.cloud = ros_cluster
+        detected_objects_list.append(do)
+    rospy.loginfo('Detected {} objects: {}'.format(len(detected_objects_labels), detected_objects_labels))
 
     # Publish the list of detected objects
+    detected_objects_pub.publish(detected_objects_list)
+
+    # Get object list params
+    object_list_param = rospy.get_param('/object_list')
+
+    # Get dropbox list params
+    dropbox = rospy.get_param('/dropbox')
+
+    dict_list = []
+    print object_list_param
+    for i in range(0, len(object_list_param)):
+        # Populate various ROS messages
+        # test_scene_num
+        test_scene_num = Int32()
+        test_scene_num.data = int(rospy.get_param('test_scene_num'))
+
+        # arm_name
+        if object_list_param[i]['group'] == 'red':
+            dropbox_index = 0
+        elif object_list_param[i]['group'] =='green':
+            dropbox_index = 1
+
+        arm_name = String()
+        arm_name.data = dropbox[dropbox_index]['name']
+
+        # object_name
+        object_name = String()
+        object_name.data = object_list_param[i]['name']
+
+
+        # pick_pose
+        pick_pose = Pose()
+        pick_pose.orientation.x = 0
+        pick_pose.orientation.y = 0
+        pick_pose.orientation.z = 0
+        pick_pose.orientation.w = 0
+        # TODO: check if object_name is there
+        if object_name.data in detected_objects_centroids:
+            pick_pose.position.x = np.asscalar(detected_objects_centroids[object_name.data][0])
+            pick_pose.position.y = np.asscalar(detected_objects_centroids[object_name.data][1])
+            pick_pose.position.z = np.asscalar(detected_objects_centroids[object_name.data][2])
+        else:
+            pick_pose.position.x = 0
+            pick_pose.position.y = 0
+            pick_pose.position.z = 0
+
+        # place_pose
+        place_pose = Pose()
+        place_pose.orientation.x = 0
+        place_pose.orientation.y = 0
+        place_pose.orientation.z = 0
+        place_pose.orientation.w = 0
+
+        place_pose.position.x = dropbox[dropbox_index]['position'][0]
+        place_pose.position.y = dropbox[dropbox_index]['position'][1]
+        place_pose.position.z = dropbox[dropbox_index]['position'][2]
+
+        yaml_dict = make_yaml_dict(test_scene_num, arm_name, object_name, pick_pose, place_pose)
+        dict_list.append(yaml_dict)
+
+    # Output location of objects to YAML
+    yaml_filename = 'output_' + str(rospy.get_param('test_scene_num')) + '.yaml'
+    send_to_yaml(yaml_filename, dict_list)
 
     # Suggested location for where to invoke your pr2_mover() function within pcl_callback()
     # Could add some logic to determine whether or not your object detections are robust
@@ -137,14 +303,33 @@ def pr2_mover(object_list):
 if __name__ == '__main__':
 
     # TODO: ROS node initialization
-
+    rospy.init_node('clustering', anonymous=True)
     # TODO: Create Subscribers
-
+    pcl_sub = rospy.Subscriber("/pr2/world/points", pc2.PointCloud2, pcl_callback, queue_size=1)
     # TODO: Create Publishers
-
+    pcl_objects_pub = rospy.Publisher("/pcl_objects", PointCloud2, queue_size=1)
+    pcl_table_pub = rospy.Publisher("/pcl_table", PointCloud2, queue_size=1)
+    pcl_cluster_pub = rospy.Publisher("/pcl_cluster", PointCloud2, queue_size=1)
     # TODO: Load Model From disk
 
     # Initialize color_list
     get_color_list.color_list = []
 
+    object_markers_pub = rospy.Publisher("/object_markers", Marker, queue_size=1)
+    detected_objects_pub = rospy.Publisher("/detected_objects", DetectedObjectsArray, queue_size=1)
+
+    # Create Publishers
+    # TODO: here you need to create two publishers
+    # Call them object_markers_pub and detected_objects_pub
+    # Have them publish to "/object_markers" and "/detected_objects" with
+    # Message Types "Marker" and "DetectedObjectsArray" , respectively
+    # Load Model From disk
+    model = pickle.load(open('model.sav', 'rb'))
+    clf = model['classifier']
+    encoder = LabelEncoder()
+    encoder.classes_ = model['classes']
+    scaler = model['scaler']
+
     # TODO: Spin while node is not shutdown
+    while not rospy.is_shutdown():
+        rospy.spin()
